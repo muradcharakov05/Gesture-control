@@ -1,0 +1,9 @@
+@echo off
+cd /d "%~dp0"
+if not exist ".venv\Scripts\python.exe" (
+  echo Virtual environment not found. Create one using Python 3.11-3.13 first.
+  pause
+  exit /b 1
+)
+".venv\Scripts\python.exe" main.py
+if errorlevel 1 pause
