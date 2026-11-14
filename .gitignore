@@ -18,3 +18,6 @@ settings.json
 settings.tmp
 qa_*.py
 qa_*.png
+models/vosk-model-*/
+voice-status.json
+voice-inbox/

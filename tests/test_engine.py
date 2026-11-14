@@ -19,8 +19,8 @@ class EngineTests(unittest.TestCase):
 
     def test_drag_has_down_up_and_no_click(self):
         e = GestureEngine(); e.update(OPEN, .5, 0, .4, DEFAULT_BINDINGS)
-        e.update(fingers(index=.1), .5, 1, .4, DEFAULT_BINDINGS)
-        self.assertEqual(kinds(e.update(fingers(index=.1), .5, 1.6, .4, DEFAULT_BINDINGS)), ['drag_start'])
+        e.update(fingers(index=.1), .5, 1, .4, DEFAULT_BINDINGS, (.3,.3))
+        self.assertEqual(kinds(e.update(fingers(index=.1), .5, 1.6, .4, DEFAULT_BINDINGS, (.34,.3))), ['drag_start'])
         self.assertEqual(e.update(fingers(index=.1), .5, 2, .4, DEFAULT_BINDINGS), [])
         self.assertEqual(kinds(e.update(OPEN, .5, 2.1, .4, DEFAULT_BINDINGS)), ['drag_end'])
 

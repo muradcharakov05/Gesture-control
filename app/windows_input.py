@@ -33,9 +33,25 @@ def map_point(x, y, bounds, monitor):
             monitor.top + 2 + round(y * max(0, monitor.height-5)))
 
 
+class MouseInput(ctypes.Structure):
+    _fields_ = [('dx', wintypes.LONG), ('dy', wintypes.LONG), ('mouseData', wintypes.DWORD), ('dwFlags', wintypes.DWORD), ('time', wintypes.DWORD), ('dwExtraInfo', ctypes.c_size_t)]
+class InputUnion(ctypes.Union):
+    _fields_ = [('mi', MouseInput)]
+class Input(ctypes.Structure):
+    _anonymous_ = ('data',)
+    _fields_ = [('type', wintypes.DWORD), ('data', InputUnion)]
+user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(Input), ctypes.c_int]
+user32.SendInput.restype = wintypes.UINT
+
+
 def move(x, y):
-    if not user32.SetCursorPos(int(x), int(y)):
-        raise OSError('Не удалось переместить курсор')
+    # Injected motion is distinguishable from a physical mouse in WH_MOUSE_LL.
+    left,top = user32.GetSystemMetrics(76),user32.GetSystemMetrics(77)
+    width,height = user32.GetSystemMetrics(78),user32.GetSystemMetrics(79)
+    nx=round((x-left)*65535/max(1,width-1));ny=round((y-top)*65535/max(1,height-1))
+    event=Input(type=0,mi=MouseInput(nx,ny,0,0x0001|0x8000|0x4000,0,0))
+    if user32.SendInput(1,ctypes.byref(event),ctypes.sizeof(Input))!=1:
+        raise OSError('Windows не разрешила перемещение курсора')
 
 
 def mouse_down():

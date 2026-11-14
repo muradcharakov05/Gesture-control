@@ -8,8 +8,15 @@ if __name__ == '__main__':
     handler = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=2, encoding='utf-8')
     logging.basicConfig(level=logging.WARNING, handlers=[handler], format='%(asctime)s %(levelname)s %(message)s')
     try:
-        from app.ui import main
-        main()
+        from app.instance import app_lock, kernel32, show_existing
+        lock, duplicate = app_lock()
+        if duplicate:
+            show_existing()
+        else:
+            try:
+                from app.ui import main
+                main()
+            finally: kernel32.CloseHandle(lock)
     except Exception:
         logging.exception('Application startup failed')
         import ctypes

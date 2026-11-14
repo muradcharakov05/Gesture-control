@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 from app.gestures import pinch_ratio
 
 ACTIONS = ("Правая кнопка", "Прокрутка", "Громче", "Тише", "Следующий слайд", "Предыдущий слайд", "Переключить окно", "Ничего")
@@ -24,30 +25,33 @@ class GestureEngine:
         self.dragging = False
         self.last_scroll_y = None
         self.fired = False
+        self.start_point = None
 
-    def update(self, ratios, wrist_y, now, threshold, bindings):
+    def update(self, ratios, wrist_y, now, threshold, bindings, pointer=None):
         events = []
-        release = threshold * 1.35
+        thresholds = threshold if isinstance(threshold, dict) else {f: threshold for f in FINGERS}
+        release = {f: thresholds[f]*1.35 for f in FINGERS}
         if self.active is None:
-            if all(r > release for r in ratios.values()):
+            if all(ratios[f] > release[f] for f in FINGERS):
                 self.armed = True
                 return events
             if not self.armed:
                 return events
             for finger in FINGERS:
-                if ratios[finger] < threshold:
+                if ratios[finger] < thresholds[finger]:
                     self.active, self.started, self.fired = finger, now, False
                     self.dragging = False
                     self.last_scroll_y = wrist_y
                     self.armed = False
+                    self.start_point = pointer
                     return [Event('gesture', finger)]
             return events
         finger = self.active
-        if ratios[finger] > release:
+        if ratios[finger] > release[finger]:
             if finger == 'index':
                 if self.dragging:
                     events.append(Event('drag_end'))
-                elif now - self.started >= .09:
+                elif .09 <= now - self.started < .55:
                     events.append(Event('left_click'))
             self.active = None
             self.dragging = False
@@ -55,7 +59,7 @@ class GestureEngine:
             self.fired = False
             return events
         if finger == 'index':
-            if not self.dragging and now - self.started >= .55:
+            if not self.dragging and now - self.started >= .55 and pointer is not None and self.start_point is not None and math.dist(pointer,self.start_point) >= .025:
                 self.dragging = True
                 events.append(Event('drag_start'))
         else:

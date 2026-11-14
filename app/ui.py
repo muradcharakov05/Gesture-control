@@ -1,5 +1,8 @@
 import queue
 import logging
+import json
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -19,6 +22,11 @@ from app.hotkey import GlobalPauseKey
 from app.tracker import Tracker
 from app.pointer_filter import PointerFilter
 from app.working_area import working_area
+from app.motion import MotionController, fist
+from app.mouse_activity import MouseActivity
+from app.advanced import advanced
+from app.voice_control import listener_running,stop_listener
+from app.voice_inbox import receive_commands
 
 BG = "#eef3f9"
 INK = "#162c49"
@@ -39,6 +47,22 @@ class App:
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.config = settings.load()
+        self.voice_status=tk.StringVar(value='Голосовой запуск выключен')
+        self.last_voice_check=0.
+        self.last_command_check=0.
+        self.pending_voice_control=None
+        self.motion = MotionController()
+        self.mouse_activity = MouseActivity()
+        self.mouse_activity.ready.wait(timeout=1)
+        self.override_until = 0.
+        self.last_physical = 0.
+        self.precision = tk.BooleanVar(value=self.config['precision'])
+        self.mouse_override = tk.BooleanVar(value=self.config['mouse_override'])
+        self.pointer_mode = tk.StringVar(value=self.config['pointer_mode'])
+        self.relative_gain = tk.DoubleVar(value=self.config['relative_gain'])
+        self.hand = tk.StringVar(value=self.config['hand'])
+        self.threshold_vars = {name:tk.DoubleVar(value=value) for name,value in self.config['thresholds'].items()}
+        self.diagnostics = tk.StringVar(value='Диагностика появится после запуска камеры')
         self.save_job = None
         self.poll_job = None
         self.camera_wait_job = None
@@ -49,6 +73,7 @@ class App:
         self.camera = tk.IntVar(value=self.config["camera"])
         self.smoothing = tk.DoubleVar(value=self.config["smoothing"])
         self.margin = tk.DoubleVar(value=self.config["margin"])
+        self.bottom_margin = tk.DoubleVar(value=self.config["bottom_margin"])
         self.pinch = tk.DoubleVar(value=self.config["pinch"])
         self.mirror = tk.BooleanVar(value=self.config["mirror"])
         self.status = tk.StringVar(value="Камера выключена")
@@ -85,16 +110,19 @@ class App:
         self.root.report_callback_exception = self.report_error
         if not self.hotkey_available:
             self.notice.set("F8 недоступна. Освободите клавишу и перезапустите программу.")
+        if self.mouse_override.get() and not self.mouse_activity.available:
+            self.notice.set('Автопауза по обычной мыши недоступна. F8 работает независимо.')
         pyautogui.PAUSE = 0
         pyautogui.FAILSAFE = True
         self.margin.trace_add('write', self.margin_changed)
+        self.bottom_margin.trace_add('write', self.bottom_margin_changed)
         self.refresh_area_status()
         self.poll_job = self.root.after(12, self.poll)
 
     def _build(self):
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("TNotebook.Tab", padding=(5, 3), font=("Segoe UI", 9))
+        style.configure("TNotebook.Tab", padding=(3, 3), font=("Segoe UI", 9))
         style.configure("TFrame", background=BG)
         style.configure("Card.TFrame", background=WHITE)
         style.configure("TLabel", background=BG, foreground=INK, font=("Segoe UI", 10))
@@ -125,6 +153,7 @@ class App:
         ttk.Label(left, textvariable=self.status, style="Card.TLabel").pack(anchor="w", pady=(10, 0))
         ttk.Label(left, textvariable=self.hand_status, style="Card.TLabel").pack(anchor="w", pady=(3, 0))
         ttk.Label(left, textvariable=self.area_status, style="Card.TLabel").pack(anchor="w", pady=(3, 0))
+        ttk.Label(left, textvariable=self.diagnostics, style="Card.TLabel", wraplength=420).pack(anchor="w", pady=(6, 0))
         ttk.Label(right, text="УПРАВЛЕНИЕ", style="Card.TLabel", font=("Segoe UI", 10, "bold")).pack(anchor="w")
         ttk.Label(right, textvariable=self.control_status, style="Card.TLabel", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(5, 0))
         ttk.Label(right, text="F8 — остановить из любого окна", style="Card.TLabel", foreground=MUTED).pack(anchor="w", pady=(0, 5))
@@ -135,17 +164,23 @@ class App:
         self.control_button = ttk.Button(buttons, text="Включить управление", command=self.toggle_control, style="Primary.TButton", state="disabled")
         self.control_button.pack(fill="x", pady=(0, 6))
         notebook = ttk.Notebook(right)
-        basic = ttk.Frame(notebook, padding=8, style='Card.TFrame'); notebook.add(basic, text='Настройки')
+        basic = ttk.Frame(notebook, padding=8, style='Card.TFrame'); notebook.add(basic, text='Общее')
         gestures = ttk.Frame(notebook, padding=8, style='Card.TFrame'); notebook.add(gestures, text='Жесты')
         profiles = ttk.Frame(notebook, padding=8, style='Card.TFrame'); notebook.add(profiles, text='Профили')
-        calibrate = ttk.Frame(notebook, padding=8, style='Card.TFrame'); notebook.add(calibrate, text='Калибровка')
+        voice=ttk.Frame(notebook,padding=8,style='Card.TFrame');notebook.add(voice,text='Голос')
+        calibrate = ttk.Frame(notebook, padding=8, style='Card.TFrame'); notebook.add(calibrate, text='Область')
+        ttk.Label(voice,text='Голосовые команды «Джарвис»',style='Card.TLabel',wraplength=280).pack(anchor='w',pady=(0,4))
+        ttk.Label(voice,textvariable=self.voice_status,style='Card.TLabel',wraplength=280).pack(anchor='w',pady=(0,4))
+        ttk.Button(voice,text='Включить голосовой запуск',command=self.start_voice).pack(fill='x',pady=3)
+        ttk.Button(voice,text='Выключить микрофон',command=stop_listener).pack(fill='x',pady=3)
+        ttk.Label(voice,text='Работает в трее, без записи звука.',style='Card.TLabel',wraplength=280).pack(anchor='w',pady=4)
         row = ttk.Frame(basic, style="Card.TFrame"); row.pack(fill="x")
         ttk.Label(row, text="Номер камеры", style="Card.TLabel").pack(side="left")
         self.camera_spin = ttk.Spinbox(row, from_=0, to=9, textvariable=self.camera, width=4, state="readonly", command=self.save_settings)
         self.camera_spin.pack(side="right")
         self._slider(basic, "Скорость курсора", self.smoothing, .1, 1.0)
         self._slider(basic, "Отступ области", self.margin, .05, .30)
-        self._slider(basic, "Порог щипка", self.pinch, .2, .8)
+        self._slider(basic, "Порог клика", self.pinch, .2, .8)
         self.mirror_check = ttk.Checkbutton(basic, text="Зеркальное изображение", variable=self.mirror, command=self.save_settings)
         self.mirror_check.pack(anchor="w", pady=(4, 2))
         ttk.Label(basic, text='Монитор', style='Card.TLabel').pack(anchor='w')
@@ -154,6 +189,7 @@ class App:
         if self.monitor_list: self.monitor_combo.current(min(self.monitor.get(), len(self.monitor_list)-1))
         self.monitor_combo.bind('<<ComboboxSelected>>', self.change_monitor)
         ttk.Checkbutton(calibrate, text='Использовать калиброванную область', variable=self.calibrated_area, command=self.change_area_mode).pack(anchor='w', pady=(0, 5))
+        self._slider(calibrate, 'Отступ снизу', self.bottom_margin, 0., .4)
         ttk.Label(calibrate, text='Сохраните границы движения и щипок.', style='Card.TLabel', wraplength=300).pack(anchor='w', pady=(0, 10))
         ttk.Button(calibrate, text='Начать калибровку', command=lambda: calibration(self)).pack(fill='x', pady=(2, 5))
         ttk.Button(calibrate, text='Сбросить калибровку', command=self.reset_calibration).pack(fill='x')
@@ -173,6 +209,7 @@ class App:
         ttk.Label(profiles, text='Для переключения профиля остановите камеру.', style='Card.TLabel', wraplength=300).pack(anchor='w', pady=8)
         toolbar = ttk.Frame(right, style='Card.TFrame'); toolbar.pack(side='bottom', fill='x', pady=(8, 0))
         ttk.Button(toolbar, text='Тренировка', command=lambda: training(self)).pack(side='left', expand=True, fill='x', padx=(0, 4))
+        ttk.Button(toolbar, text='Ещё', command=lambda:advanced(self)).pack(side='left', fill='x', expand=True, padx=(0,4))
         ttk.Button(toolbar, text='В трей', command=self.minimize_to_tray).pack(side='left', expand=True, fill='x')
         notebook.pack(fill='both', expand=True)
         ttk.Label(outer, textvariable=self.notice, style="Sub.TLabel", wraplength=960).pack(side="bottom", anchor="w", pady=(12, 0))
@@ -183,10 +220,18 @@ class App:
         ttk.Label(row, text=label, style='Card.TLabel').pack(side='left')
         text = tk.StringVar()
         def update_value(*_):
-            text.set(f'{var.get():.0%}' if var is self.margin else f'{var.get():.2f}')
-        var.trace_add('write', update_value); update_value()
+            text.set(f'{var.get():.0%}' if var is self.margin or var is self.bottom_margin else f'{var.get():.2f}')
+        trace = var.trace_add('write', update_value); update_value()
+        row.bind('<Destroy>', lambda event: var.trace_remove('write', trace))
         ttk.Label(row, textvariable=text, width=5, style='Card.TLabel').pack(side='right')
         ttk.Scale(row, from_=low, to=high, variable=var, orient='horizontal', length=70, command=lambda _: self.schedule_save()).pack(side='right', fill='x', expand=True, padx=(6, 0))
+
+    def start_voice(self):
+        if listener_running():
+            self.voice_status.set('Слушатель уже запущен');return
+        project=Path(__file__).resolve().parent.parent
+        subprocess.Popen([str(Path(sys.executable).with_name('pythonw.exe')),str(project/'wake_listener.py')],cwd=project)
+        self.voice_status.set('Запуск микрофона…')
 
     def schedule_save(self):
         if self.loading_profile: return
@@ -194,7 +239,13 @@ class App:
         self.save_job = self.root.after(250, self.save_settings)
 
     def refresh_area_status(self):
-        self.area_status.set('Область: калибровка' if self.calibrated_area.get() else f'Область: ручной отступ {self.margin.get():.0%}')
+        mode='Калибровка' if self.calibrated_area.get() else f'Отступ {self.margin.get():.0%}'
+        self.area_status.set(f'{mode} · снизу {self.bottom_margin.get():.0%}')
+
+    def bottom_margin_changed(self, *_):
+        if self.loading_profile: return
+        self.config['bottom_margin']=self.bottom_margin.get()
+        self.refresh_area_status();self.reset_motion();self.schedule_save()
 
     def margin_changed(self, *_):
         if self.loading_profile: return
@@ -202,7 +253,7 @@ class App:
         self.config['area_mode'] = 'manual'
         self.config['margin'] = self.margin.get()
         self.refresh_area_status()
-        self.pointer_filter.reset(); self.cursor = None
+        self.reset_motion()
         self.schedule_save()
 
     def change_area_mode(self):
@@ -211,7 +262,7 @@ class App:
             self.notice.set('Сначала выполните калибровку.')
         self.config['area_mode'] = 'calibrated' if self.calibrated_area.get() else 'manual'
         self.refresh_area_status()
-        self.pointer_filter.reset(); self.cursor = None
+        self.reset_motion()
         self.save_settings()
 
     def save_settings(self):
@@ -219,9 +270,11 @@ class App:
             self.root.after_cancel(self.save_job); self.save_job = None
         if self.loading_profile: return
         try:
-            self.config.update({"camera": self.camera.get(), "smoothing": self.smoothing.get(), "margin": self.margin.get(), "pinch": self.pinch.get(), "mirror": self.mirror.get(),
+            self.config.update({"camera": self.camera.get(), "smoothing": self.smoothing.get(), "margin": self.margin.get(), "bottom_margin": self.bottom_margin.get(), "pinch": self.pinch.get(), "mirror": self.mirror.get(),
                                 "area_mode": "calibrated" if self.calibrated_area.get() else "manual", "monitor": self.monitor.get(), "palm_toggle": self.palm_enabled.get(),
-                                "bindings": {key: value.get() for key, value in self.bindings.items()}})
+                                "bindings": {key: value.get() for key, value in self.bindings.items()},
+                                "precision":self.precision.get(), "mouse_override":self.mouse_override.get(), "pointer_mode":self.pointer_mode.get(),
+                                "relative_gain":self.relative_gain.get(), "hand":self.hand.get(), "thresholds":{k:v.get() for k,v in self.threshold_vars.items()}})
             settings.save(self.config)
         except (OSError, tk.TclError, ValueError) as exc:
             self.notice.set(f"Не удалось сохранить настройки: {exc}")
@@ -251,6 +304,10 @@ class App:
         self.store = store; self.config = store['profiles'][selected].copy()
         self.loading_profile = True
         try:
+            self.precision.set(self.config['precision']);self.mouse_override.set(self.config['mouse_override'])
+            self.pointer_mode.set(self.config['pointer_mode']);self.relative_gain.set(self.config['relative_gain']);self.hand.set(self.config['hand'])
+            for name,var in self.threshold_vars.items():var.set(self.config['thresholds'][name])
+            self.bottom_margin.set(self.config['bottom_margin'])
             self.calibrated_area.set(self.config['area_mode'] == 'calibrated')
             self.camera.set(self.config['camera']); self.smoothing.set(self.config['smoothing']); self.margin.set(self.config['margin'])
             self.pinch.set(self.config['pinch']); self.mirror.set(self.config['mirror']); self.palm_enabled.set(self.config['palm_toggle'])
@@ -302,7 +359,7 @@ class App:
         self.save_settings()
         self.last_frame = 0
         self.camera_started = time.monotonic()
-        self.tracker = Tracker(self.camera.get(), self.mirror.get())
+        self.tracker = Tracker(self.camera.get(), self.mirror.get(), self.hand.get())
         self.tracker.start()
         self.camera_button.configure(text="Остановить камеру")
         self.camera_spin.configure(state="disabled")
@@ -334,7 +391,11 @@ class App:
             self.camera_button.configure(state="normal")
             self.status.set("Камера выключена")
 
+    def reset_motion(self):
+        self.motion.reset();self.pointer_filter.reset();self.cursor=None
+
     def disable_control(self):
+        self.pending_voice_control=None
         if self.mouse_held:
             wi.mouse_up(); self.mouse_held = False
         self.palm.disarm()
@@ -343,6 +404,7 @@ class App:
         self.hand_since = None
         self.cursor = None
         self.pointer_filter.reset()
+        self.motion.reset()
         self.control_status.set("Управление выключено")
         if hasattr(self, "control_button"):
             self.control_button.configure(text="Включить управление")
@@ -377,7 +439,40 @@ class App:
         finally:
             if not self.closing: self.poll_job = self.root.after(12, self.poll)
 
+    def handle_voice_command(self,command):
+        if command=='open':
+            self.root.deiconify();self.root.lift()
+        elif command=='control_off':
+            self.disable_control();self.notice.set('Голос: управление выключено.')
+        elif command=='camera_off':
+            self.stop_camera();self.notice.set('Голос: камера и управление выключены.')
+        elif command in ('camera_on','control_on'):
+            if self.calibrating:
+                self.notice.set('Сначала завершите калибровку.');return
+            if not self.tracker or not self.tracker.thread.is_alive():self.toggle_camera()
+            elif self.tracker.stop_event.is_set():
+                self.notice.set('Дождитесь остановки камеры и повторите команду.');return
+            if command=='control_on':
+                if not self.hotkey_available:
+                    self.notice.set('Управление не включено: F8 недоступна.');return
+                self.pending_voice_control=time.monotonic()+12
+                self.notice.set('Голос: ожидаю камеру для включения управления…')
+            else:self.notice.set('Голос: камера запущена.')
+
     def _poll(self):
+        if time.monotonic()-self.last_command_check>=.1:
+            self.last_command_check=time.monotonic()
+            for command in receive_commands():self.handle_voice_command(command)
+        if time.monotonic()-self.last_voice_check>1:
+            self.last_voice_check=time.monotonic()
+            try:
+                state=json.loads((settings.PATH.parent/'voice-status.json').read_text(encoding='utf-8'))
+                self.voice_status.set(state.get('message','') if listener_running() else (state['message'] if state.get('state')=='error' else 'Микрофон выключен'))
+            except (OSError,ValueError):self.voice_status.set('Голосовой запуск выключен')
+        if self.mouse_override.get() and self.mouse_activity.last_activity > self.last_physical:
+            self.last_physical=self.mouse_activity.last_activity
+            self.override_until=time.monotonic()+2
+            self.lost_hand()
         while True:
             try: tray_event = self.tray_events.get_nowait()
             except queue.Empty: break
@@ -388,6 +483,9 @@ class App:
             self.pause_requested.clear()
             self.disable_control()
             self.notice.set("Управление остановлено клавишей F8.")
+        if self.pending_voice_control and time.monotonic()>self.pending_voice_control:
+            self.pending_voice_control=None
+            self.notice.set('Не удалось включить управление: камера не готова.')
         if self.tracker and not self.tracker.stop_event.is_set():
             try:
                 item = self.tracker.results.get_nowait()
@@ -399,10 +497,20 @@ class App:
                     self.stop_camera()
                     self.notice.set(error)
                 else:
-                    _, rgb, points, captured = item
+                    _, rgb, points, captured, *extra = item
+                    if extra:
+                        meta=extra[0];latency=(time.monotonic()-captured)*1000
+                        hint=meta.get('hint','')
+                        if latency>150 and not hint:hint='Высокая задержка кадра'
+                        hand={'left':'левая','right':'правая'}.get(meta.get('hand'),'—')
+                        self.diagnostics.set(f"{meta.get('fps',0):.0f} кадр/с · кадр {latency:.0f} мс · рука: {hand}" + (f"\n{hint}" if hint else ''))
                     self.last_frame = captured
                     self.status.set("Камера работает")
                     self.control_button.configure(state="normal" if self.hotkey_available else "disabled")
+                    if self.pending_voice_control and time.monotonic()-captured<.35:
+                        if not self.enabled:self.toggle_control()
+                        self.pending_voice_control=None
+                        if self.enabled:self.notice.set('Голос: управление включено. F8 — пауза.')
                     if time.monotonic() - captured < .35:
                         self.process(points, captured, rgb.shape[1], rgb.shape[0])
                     else:
@@ -427,6 +535,7 @@ class App:
         self.hand_since = None
         self.cursor = None
         self.pointer_filter.reset()
+        self.motion.reset()
         self.engine.reset()
         self.last_hand = None
         self.palm.disarm()
@@ -440,8 +549,12 @@ class App:
         self.last_hand = (points, now, width / height)
         self.hand_status.set("Рука найдена")
         if self.calibrating: return
+        if self.mouse_override.get() and time.monotonic()<self.override_until:
+            self.gesture_status.set('Обычная мышь · автопауза');return
+        if self.pointer_mode.get()=='relative' and fist(points,width/height):
+            self.lost_hand();self.gesture_status.set('Перехват: верните руку и раскройте');return
         ratios = distances(points, width / height)
-        if self.palm_enabled.get() and self.palm.update(open_palm(points, ratios, self.pinch.get(), width / height), now):
+        if self.palm_enabled.get() and self.palm.update(open_palm(points, ratios, max([self.pinch.get()]+[v.get() for v in self.threshold_vars.values()]), width / height), now):
             if self.enabled:
                 self.disable_control(); self.notice.set('Пауза жестом открытой ладони.')
             else:
@@ -451,7 +564,8 @@ class App:
         if self.hand_since is None:
             self.hand_since = now; return
         if now - self.hand_since < .5: return
-        events = self.engine.update(ratios, points[0].y, now, self.pinch.get(), {k: v.get() for k,v in self.bindings.items()})
+        thresholds={k:v.get() for k,v in self.threshold_vars.items()};thresholds['index']=self.pinch.get()
+        events = self.engine.update(ratios, points[0].y, now, thresholds, {k: v.get() for k,v in self.bindings.items()}, (points[8].x*width/height,points[8].y))
         labels = {'index': 'Указательный: клик / перетаскивание', 'middle': 'Средний палец', 'ring': 'Безымянный палец', 'pinky': 'Мизинец'}
         idle = 'Готово к жесту' if self.engine.armed else 'Разомкните пальцы'
         self.gesture_status.set(labels.get(self.engine.active, idle))
@@ -460,17 +574,19 @@ class App:
             if not self.monitor_list: raise RuntimeError('Монитор не найден')
             monitor = self.monitor_list[min(self.monitor.get(), len(self.monitor_list)-1)]
             bounds = working_area(self.config, self.margin.get())
-            target = wi.map_point(points[8].x, points[8].y, bounds, monitor)
+            current=tuple(float(v) for v in pyautogui.position())
+            target = self.motion.update((points[8].x,points[8].y),now,current,bounds,monitor,self.pointer_mode.get(),self.precision.get(),self.relative_gain.get())
             if self.cursor is None:
                 self.cursor = tuple(float(v) for v in pyautogui.position())
                 self.pointer_filter.seed(self.cursor, target, now)
             transitioning = any(e.kind in ('left_click', 'drag_start', 'drag_end') for e in events)
             if not transitioning and (self.engine.active is None or (self.engine.active == 'index' and self.engine.dragging)):
-                self.cursor = self.pointer_filter.update(target, now, self.smoothing.get(), (monitor.width, monitor.height))
+                self.cursor = self.pointer_filter.update(target, now, self.smoothing.get(), (monitor.width, monitor.height), self.precision.get())
                 wi.move(round(self.cursor[0]), round(self.cursor[1]))
             else:
                 # Do not accumulate hand motion while the pointer is intentionally frozen.
                 self.pointer_filter.seed(self.cursor, target, now)
+                self.motion.freeze()
             for event in events:
                 if event.kind == 'left_click': wi.left_click(); self.gesture_status.set('Левый клик')
                 elif event.kind == 'drag_start': wi.mouse_down(); self.mouse_held = True; self.gesture_status.set('Перетаскивание')
@@ -493,7 +609,7 @@ class App:
         frame = rgb.copy()
         height, width = frame.shape[:2]
         x1, y1, x2, y2 = working_area(self.config, self.margin.get())
-        cv2.rectangle(frame, (int(width*x1), int(height*y1)), (int(width*x2), int(height*y2)), (80, 200, 240), 2)
+        cv2.rectangle(frame, (int(width*x1), int(height*y1)), (min(width-1, int(width*x2)), min(height-1, int(height*y2))), (80, 200, 240), 2)
         if points:
             for point in points:
                 cv2.circle(frame, (int(point.x*width), int(point.y*height)), 3, (92, 235, 185), -1)
@@ -517,6 +633,7 @@ class App:
         if self.tracker:
             self.tracker.stop()
         self.hotkey.close()
+        self.mouse_activity.close()
         if self.tray: self.tray.close()
         self.save_settings()
         self.root.destroy()

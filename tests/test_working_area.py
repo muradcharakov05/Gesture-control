@@ -23,13 +23,23 @@ class WorkingAreaTests(unittest.TestCase):
     def test_legacy_calibration_preserved(self):
         config = settings.validate({'bounds': [.1,.2,.8,.9], 'margin': .3})
         self.assertEqual(config['area_mode'], 'calibrated')
-        self.assertEqual(working_area(config), (.1,.2,.8,.9))
+        self.assertEqual(working_area(config), (.1,.2,.8,.8))
 
     def test_manual_margin_changes_mapping_despite_saved_calibration(self):
         config = settings.validate({'bounds': [.1,.2,.8,.9], 'margin': .3, 'area_mode': 'manual'})
-        self.assertEqual(working_area(config), (.3,.3,.7,.7))
+        self.assertEqual(working_area(config), (.3,.3,.7,.8))
         m=Monitor('test',0,0,1920,1080)
         self.assertNotEqual(map_point(.35,.35,working_area(config,.1),m), map_point(.35,.35,working_area(config,.3),m))
+
+    def test_screen_bottom_reached_above_camera_edge(self):
+        area=working_area(settings.validate({}))
+        self.assertEqual(area[3],.8)
+        self.assertEqual(map_point(.5,.8,area,Monitor('test',0,0,1920,1080))[1],1077)
+
+    def test_bottom_inset_applies_to_calibration_and_keeps_valid_height(self):
+        area=working_area({'area_mode':'calibrated','bounds':[.1,.85,.9,.98],'bottom_margin':.3})
+        self.assertAlmostEqual(area[3],.7)
+        self.assertGreaterEqual(round(area[3]-area[1],5),.1)
 
 
 class UiRegressionTests(unittest.TestCase):
@@ -47,14 +57,21 @@ class UiRegressionTests(unittest.TestCase):
         self.assertTrue(self.app.calibrated_area.get())
         self.app.margin.set(.25)
         self.assertFalse(self.app.calibrated_area.get())
-        self.assertEqual(working_area(self.app.config,self.app.margin.get()),(.25,.25,.75,.75))
+        self.assertEqual(working_area(self.app.config,self.app.margin.get()),(.25,.25,.75,.8))
         self.app.save_settings()
         stored=settings.load()
         self.assertEqual(stored['area_mode'],'manual')
         self.assertEqual(stored['margin'],.25)
         self.assertEqual(stored['bounds'],[.1,.2,.8,.9])
         self.app.calibrated_area.set(True); self.app.change_area_mode()
-        self.assertEqual(working_area(self.app.config),(.1,.2,.8,.9))
+        self.assertEqual(working_area(self.app.config),(.1,.2,.8,.8))
+
+    def test_bottom_inset_saves_without_disabling_calibration(self):
+        self.app.bottom_margin.set(.3)
+        self.assertTrue(self.app.calibrated_area.get())
+        self.assertAlmostEqual(working_area(self.app.config)[3],.7)
+        self.app.save_settings()
+        self.assertEqual(settings.load()['bottom_margin'],.3)
 
     def test_slider_changes_coalesce_disk_writes(self):
         with patch('app.ui.settings.save') as save:

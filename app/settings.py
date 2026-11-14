@@ -4,7 +4,8 @@ import os
 from pathlib import Path
 from app.gesture_engine import ACTIONS, DEFAULT_BINDINGS
 
-DEFAULTS = {"camera": 0, "smoothing": 0.35, "margin": 0.15, "pinch": 0.42, "mirror": True,
+DEFAULTS = {"camera": 0, "smoothing": 0.35, "margin": 0.15, "bottom_margin": 0.2, "pinch": 0.42, "mirror": True,
+            "precision": True, "mouse_override": True, "pointer_mode": "absolute", "hand": "any", "relative_gain": 1.0, "thresholds": {},
             "bounds": None, "area_mode": "manual", "monitor": 0, "palm_toggle": False, "bindings": DEFAULT_BINDINGS}
 PATH = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "GestureControl" / "settings.json"
 
@@ -13,12 +14,18 @@ def validate(data):
     values = copy.deepcopy(DEFAULTS)
     if not isinstance(data, dict):
         return values
-    for key, low, high in (("camera", 0, 9), ("smoothing", .1, 1.), ("margin", .05, .3), ("pinch", .2, .8), ("monitor", 0, 20)):
+    for key, low, high in (("camera", 0, 9), ("smoothing", .1, 1.), ("margin", .05, .3), ("bottom_margin", 0., .4), ("pinch", .2, .8), ("monitor", 0, 20), ("relative_gain", .3, 3.)):
         value = data.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool) and low <= value <= high:
             values[key] = int(value) if key in ('camera', 'monitor') else float(value)
-    for key in ('mirror', 'palm_toggle'):
+    for key in ('mirror', 'palm_toggle', 'precision', 'mouse_override'):
         if isinstance(data.get(key), bool): values[key] = data[key]
+    for key, choices in (('pointer_mode',('absolute','relative')),('hand',('any','left','right'))):
+        if data.get(key) in choices: values[key]=data[key]
+    raw=data.get('thresholds',{})
+    for finger in ('middle','ring','pinky'):
+        value=raw.get(finger,values['pinch']) if isinstance(raw,dict) else values['pinch']
+        values['thresholds'][finger]=float(value) if isinstance(value,(float,int)) and not isinstance(value,bool) and .2<=value<=.8 else values['pinch']
     bounds = data.get('bounds')
     if isinstance(bounds, list) and len(bounds) == 4 and all(isinstance(v, (float, int)) and not isinstance(v, bool) and 0 <= v <= 1 for v in bounds):
         if bounds[2] - bounds[0] >= .1 and bounds[3] - bounds[1] >= .1:
